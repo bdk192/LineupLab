@@ -47,14 +47,16 @@ def bucket_score_diff(diff):
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner="Loading play-by-play data (first load can take a minute)...")
 def load_pbp(seasons):
-    import nfl_data_py as nfl
-    return nfl.import_pbp_data(seasons, downcast=True)
+    import nflreadpy as nfl
+    # nflreadpy returns Polars DataFrames -- convert to pandas since the
+    # rest of this app (and pandas' groupby/pivot_table) expects pandas.
+    return nfl.load_pbp(seasons).to_pandas()
 
 
 @st.cache_data(ttl=86400, show_spinner="Loading schedule data...")
 def load_schedule(seasons):
-    import nfl_data_py as nfl
-    return nfl.import_schedules(seasons)
+    import nflreadpy as nfl
+    return nfl.load_schedules(seasons).to_pandas()
 
 
 # ---------------------------------------------------------------------------
