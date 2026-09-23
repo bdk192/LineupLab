@@ -44,6 +44,32 @@ def bucket_score_diff(diff):
 
 
 # ---------------------------------------------------------------------------
+# RECENCY WEIGHTING (used by multiple signals so recent weeks matter more
+# than early-season ones -- addresses using this week-to-week rather than
+# treating the whole SEASONS window as one flat average)
+# ---------------------------------------------------------------------------
+RECENCY_HALF_LIFE_WEEKS = 6  # a game 6 weeks old counts half as much as this week
+
+
+def add_recency_weight(df: pd.DataFrame, season_col="season", week_col="week") -> pd.DataFrame:
+    """Adds a 'recency_weight' column: 1.0 for the most recent available
+    week in the data, decaying by half every RECENCY_HALF_LIFE_WEEKS weeks
+    before that. Assumes season_col/week_col exist and are non-null."""
+    df = df.copy()
+    time_index = df[season_col] * 100 + df[week_col]  # fine since no season has 100+ weeks
+    current = time_index.max()
+    weeks_ago = current - time_index
+    df["recency_weight"] = 0.5 ** (weeks_ago / RECENCY_HALF_LIFE_WEEKS)
+    return df
+
+
+def weighted_mean(series: pd.Series, weights: pd.Series) -> float:
+    if weights.sum() == 0 or weights.isna().all():
+        return series.mean()
+    return float(np.average(series, weights=weights.fillna(0)))
+
+
+# ---------------------------------------------------------------------------
 # DATA LOADING (cached -- runs once per day per unique input, not per click)
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner="Loading play-by-play data (first load can take a minute)...")
@@ -248,10 +274,17 @@ def compute_schedule_effects(schedule: pd.DataFrame, pbp: pd.DataFrame) -> pd.Da
     )
     merged = merged.merge(baseline, on=["season", "team"])
     merged["epa_delta_vs_baseline"] = merged["epa_per_play"] - merged["season_baseline_epa"]
+    merged = add_recency_weight(merged)
 
+    # Recency-weighted mean, not a flat average -- a short-rest game from
+    # 6 weeks ago counts about half as much as this week's, so the signal
+    # reflects how a team looks NOW rather than a season-long blend.
     return (
         merged.groupby(["team", "rest_bucket"])
-        .agg(games=("epa_delta_vs_baseline", "size"), avg_epa_delta=("epa_delta_vs_baseline", "mean"))
+        .apply(lambda g: pd.Series({
+            "games": len(g),
+            "avg_epa_delta": weighted_mean(g["epa_delta_vs_baseline"], g["recency_weight"]),
+        }))
         .reset_index()
     )
 
@@ -361,7 +394,7 @@ def compute_pressure_signal(participation: pd.DataFrame, pbp: pd.DataFrame):
         warnings.append("[pressure_signal] pbp is missing game_id/play_id -- can't join.")
         return pd.DataFrame(), warnings
 
-    pbp_small = pbp[["game_id", "play_id", "posteam"]].dropna(subset=["posteam"])
+    pbp_small = pbp[["game_id", "play_id", "posteam", "season", "week"]].dropna(subset=["posteam"])
     merged = part.merge(pbp_small, on=["game_id", "play_id"], how="inner")
 
     if merged.empty:
@@ -373,11 +406,24 @@ def compute_pressure_signal(participation: pd.DataFrame, pbp: pd.DataFrame):
         )
         return pd.DataFrame(), warnings
 
-    agg_kwargs = {"plays": (pressure_col, "size"), "pressure_rate": (pressure_col, "mean")}
-    summary = merged.groupby("posteam").agg(**agg_kwargs).reset_index().rename(columns={"posteam": "team"})
+    merged = add_recency_weight(merged)
+
+    summary = (
+        merged.groupby("posteam")
+        .apply(lambda g: pd.Series({
+            "plays": len(g),
+            "pressure_rate": weighted_mean(g[pressure_col], g["recency_weight"]),
+        }))
+        .reset_index()
+        .rename(columns={"posteam": "team"})
+    )
 
     if "time_to_throw" in merged.columns:
-        ttt = merged.groupby("posteam")["time_to_throw"].mean().reset_index()
+        ttt = (
+            merged.groupby("posteam")
+            .apply(lambda g: weighted_mean(g["time_to_throw"], g["recency_weight"]))
+            .reset_index()
+        )
         ttt.columns = ["team", "avg_time_to_throw"]
         summary = summary.merge(ttt, on="team", how="left")
 
@@ -431,6 +477,74 @@ def compute_scheme_signal(participation: pd.DataFrame, pbp: pd.DataFrame):
     pivot = pivot.reset_index().rename(columns={"defteam": "team"})
 
     return pivot, warnings
+
+
+# ---------------------------------------------------------------------------
+# SIGNAL 4c: opponent matchup strength -- how tough a team's DEFENSE is,
+# recency-weighted, meant to be looked up against a player's UPCOMING
+# opponent specifically. This was a genuine gap: every other signal
+# described a player's own team's context, but nothing captured "how hard
+# is this player's actual next matchup" -- which is the classic weekly
+# fantasy question and what makes this usable week-to-week rather than
+# just a season-long reference table.
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner="Computing opponent defensive strength signal...")
+def compute_defense_strength_signal(pbp: pd.DataFrame):
+    warnings = []
+    required = ["defteam", "play_type", "epa", "season", "week"]
+    missing = [c for c in required if c not in pbp.columns]
+    if missing:
+        warnings.append(f"[defense_strength] Missing columns {missing}. Skipping this signal.")
+        return pd.DataFrame(), warnings
+
+    off = pbp[pbp["defteam"].notna() & pbp["play_type"].isin(["run", "pass"])].copy()
+    off = add_recency_weight(off)
+
+    summary = (
+        off.groupby("defteam")
+        .apply(lambda g: pd.Series({
+            "plays_faced": len(g),
+            # Higher = defense allows MORE positive EPA per play = WEAKER
+            # defense = easier matchup for the offense facing them.
+            "def_epa_allowed": weighted_mean(g["epa"], g["recency_weight"]),
+        }))
+        .reset_index()
+        .rename(columns={"defteam": "team"})
+    )
+    warnings.extend(validate_signal("def_epa_allowed", summary["def_epa_allowed"], (-0.3, 0.3)))
+    return summary, warnings
+
+
+def compute_next_opponent_map(schedule: pd.DataFrame) -> tuple:
+    """For each team, find their next upcoming (not-yet-played) game and
+    who they face -- the lookup that lets any signal be applied to a
+    player's SPECIFIC upcoming matchup rather than a season-long average."""
+    warnings = []
+    cols = schedule.columns.tolist()
+    score_cols_present = "home_score" in cols and "away_score" in cols
+    if not score_cols_present or not {"home_team", "away_team", "season", "week"}.issubset(cols):
+        warnings.append(
+            f"[next_opponent] Couldn't find expected schedule columns "
+            f"(home_score/away_score/home_team/away_team/season/week). "
+            f"Actual columns found: {cols}. Skipping upcoming-matchup lookup."
+        )
+        return pd.DataFrame(), warnings
+
+    upcoming = schedule[schedule["home_score"].isna() & schedule["away_score"].isna()].copy()
+    if upcoming.empty:
+        warnings.append(
+            "[next_opponent] No upcoming (unplayed) games found in schedule data -- "
+            "either the season is over or schedule data doesn't extend forward yet."
+        )
+        return pd.DataFrame(), warnings
+
+    rows = []
+    for _, g in upcoming.iterrows():
+        rows.append({"team": g["home_team"], "opponent": g["away_team"], "season": g["season"], "week": g["week"]})
+        rows.append({"team": g["away_team"], "opponent": g["home_team"], "season": g["season"], "week": g["week"]})
+    long_form = pd.DataFrame(rows).sort_values(["team", "season", "week"])
+    next_opp = long_form.groupby("team", as_index=False).first()  # earliest upcoming game per team
+    return next_opp[["team", "opponent", "week"]], warnings
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +671,7 @@ def validate_signal(name, series, expected_range):
     return warnings
 
 
-def build_dashboard_data(usage_df: pd.DataFrame, schedule_df: pd.DataFrame, player_team_map: pd.DataFrame, pressure_df: pd.DataFrame, injury_df: pd.DataFrame):
+def build_dashboard_data(usage_df: pd.DataFrame, schedule_df: pd.DataFrame, player_team_map: pd.DataFrame, pressure_df: pd.DataFrame, injury_df: pd.DataFrame, defense_strength_df: pd.DataFrame, next_opponent_df: pd.DataFrame):
     warnings = []
     warnings.extend(validate_signal("role_volatility", usage_df["role_volatility"], (0.0, 0.5)))
 
@@ -627,6 +741,36 @@ def build_dashboard_data(usage_df: pd.DataFrame, schedule_df: pd.DataFrame, play
             "without it. See the injury/practice tab for the specific reason."
         )
 
+    # Upcoming opponent's defensive strength -- the piece that ties the
+    # composite to a player's SPECIFIC next matchup rather than only their
+    # own team's season-long context. Join: player's team -> next_opponent
+    # -> that opponent's def_epa_allowed.
+    if not next_opponent_df.empty and not defense_strength_df.empty:
+        opp_strength = next_opponent_df.merge(
+            defense_strength_df[["team", "def_epa_allowed"]].rename(
+                columns={"team": "opponent", "def_epa_allowed": "opponent_def_epa_allowed"}
+            ),
+            on="opponent",
+            how="left",
+        )
+        # Higher opponent_def_epa_allowed = weaker defense = easier matchup,
+        # so no sign flip needed -- higher z = better matchup, consistent
+        # with the other composite components.
+        opp_strength["matchup_z"] = zscore(opp_strength["opponent_def_epa_allowed"])
+        usage_df = usage_df.merge(
+            opp_strength[["team", "opponent", "week", "opponent_def_epa_allowed", "matchup_z"]],
+            on="team",
+            how="left",
+        )
+        composite_components.append("matchup_z")
+    else:
+        warnings.append(
+            "[matchup_signal] Not available this run -- composite score built "
+            "without an upcoming-opponent adjustment. See the This Week's "
+            "Matchup tab for the specific reason (often just means no "
+            "upcoming games are scheduled yet, e.g. between seasons)."
+        )
+
     # Use the roster's real full name for display/search when available --
     # the pbp-derived player_name column is abbreviated (e.g. "T.Kelce"),
     # which breaks searches for a full first name.
@@ -665,7 +809,11 @@ pressure_df, pressure_warnings = compute_pressure_signal(participation, pbp)
 scheme_df, scheme_warnings = compute_scheme_signal(participation, pbp)
 contract_df, contract_warnings = compute_contract_year_signal(contracts, max(SEASONS))
 injury_df, injury_warnings = compute_injury_signal(injuries)
-usage_df, short_rest_df, warnings = build_dashboard_data(usage_df, schedule_df, player_team_map, pressure_df, injury_df)
+defense_strength_df, defense_strength_warnings = compute_defense_strength_signal(pbp)
+next_opponent_df, next_opponent_warnings = compute_next_opponent_map(schedule)
+usage_df, short_rest_df, warnings = build_dashboard_data(
+    usage_df, schedule_df, player_team_map, pressure_df, injury_df, defense_strength_df, next_opponent_df
+)
 
 # Contract-year status merges directly by player_id (a true player-level
 # signal, unlike the team-level ones) -- shown as context, not part of the
@@ -674,7 +822,10 @@ if not contract_df.empty:
     usage_df = usage_df.merge(contract_df, on="player_id", how="left")
 
 referee_df, referee_warnings = compute_referee_signal(schedule, pbp)
-warnings = warnings + referee_warnings + pressure_warnings + scheme_warnings + contract_warnings + injury_warnings
+warnings = (
+    warnings + referee_warnings + pressure_warnings + scheme_warnings + contract_warnings
+    + injury_warnings + defense_strength_warnings + next_opponent_warnings
+)
 
 with st.expander(f"Validation report ({len(warnings)} issue(s))", expanded=len(warnings) > 0):
     if warnings:
@@ -699,20 +850,20 @@ if player_search:
     else:
         show_cols = [
             c for c in [
-                "display_name", "team", "usage_type", "total_opportunities",
+                "display_name", "team", "opponent", "usage_type", "total_opportunities",
                 "role_volatility", "short_rest_epa_delta", "pressure_rate_delta_vs_league",
                 "is_contract_year", "recent_avg_practice_severity", "report_status",
-                "composite_score",
+                "opponent_def_epa_allowed", "composite_score",
             ] if c in match.columns
         ]
         st.dataframe(match[show_cols], use_container_width=True)
 
 st.divider()
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Player usage signal", "Team rest/travel signal", "Referee/pace signal",
     "O-line/pressure signal", "Defensive scheme signal", "Contract-year signal",
-    "Injury/practice trend",
+    "Injury/practice trend", "This Week's Matchups",
 ])
 
 with tab1:
@@ -823,6 +974,30 @@ with tab7:
         st.caption("Severity scale: 0 = Full Participation, 1 = Limited, 2 = Did Not Participate.")
     else:
         st.info("No injury data available this run -- see the validation report above for why.")
+
+with tab8:
+    st.subheader("This Week's Matchups")
+    st.caption(
+        "The weekly-planning view: each team's actual next opponent, how "
+        "strong that opponent's defense is (recency-weighted, so recent "
+        "weeks count more), and that opponent's man/zone coverage tendency. "
+        "opponent_def_epa_allowed IS in the composite score above; the "
+        "scheme rate is shown for manual matchup-checking (e.g. a slot "
+        "receiver facing a heavy-zone defense) since it isn't yet matched "
+        "to individual receiver route profiles."
+    )
+    if next_opponent_df.empty or defense_strength_df.empty:
+        st.info("No upcoming matchup data available this run -- see the validation report above for why.")
+    else:
+        matchup_view = next_opponent_df.merge(
+            defense_strength_df, left_on="opponent", right_on="team", how="left", suffixes=("", "_opp")
+        )
+        if not scheme_df.empty:
+            matchup_view = matchup_view.merge(
+                scheme_df, left_on="opponent", right_on="team", how="left", suffixes=("", "_scheme")
+            )
+        display_cols = [c for c in matchup_view.columns if not c.endswith(("_opp", "_scheme")) and c != "team_scheme"]
+        st.dataframe(matchup_view[display_cols], use_container_width=True)
 
 st.caption(
     "Player and team signals are now joined via each player's current roster "
