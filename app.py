@@ -125,6 +125,28 @@ def load_contracts():
     return nfl.load_contracts().to_pandas()
 
 
+@st.cache_data(ttl=86400, show_spinner="Loading injury/practice report data...")
+def load_injuries(seasons):
+    import nflreadpy as nfl
+    # Official NFL injury reports (practice participation + game status).
+    # This is a direct, structured replacement for what a beat-report NLP
+    # signal was trying to approximate indirectly -- the league already
+    # publishes exactly this, updated through the current season.
+    needed = ["season", "week", "gsis_id", "full_name", "team", "practice_status", "report_status"]
+    seasons_to_try = sorted(seasons)
+    df = None
+    while seasons_to_try:
+        try:
+            df = nfl.load_injuries(seasons_to_try)
+            break
+        except ValueError:
+            seasons_to_try = seasons_to_try[:-1]
+    if df is None:
+        return pd.DataFrame()
+    available = [c for c in needed if c in df.columns]
+    return df.select(available).to_pandas()
+
+
 def build_player_team_map(rosters: pd.DataFrame) -> pd.DataFrame:
     """One row per player: their most recent known team across the loaded
     seasons. Handles mid-season trades by keeping the latest season's row."""
@@ -454,8 +476,62 @@ def compute_contract_year_signal(contracts: pd.DataFrame, reference_season: int)
 
 
 # ---------------------------------------------------------------------------
-# VALIDATION + COMPOSITE (same logic/spirit as combine_signals.py)
+# SIGNAL 6: injury / practice-participation trend
+# (structured replacement for the originally-planned NLP-on-beat-reports
+# signal -- the league's own injury reports ARE the early-warning data
+# that NLP was trying to approximate indirectly from unstructured text)
 # ---------------------------------------------------------------------------
+PRACTICE_SEVERITY = {
+    "Full Participation in Practice": 0,
+    "Limited Participation in Practice": 1,
+    "Did Not Participate In Practice": 2,
+}
+
+
+@st.cache_data(show_spinner="Computing injury/practice-trend signal...")
+def compute_injury_signal(injuries: pd.DataFrame):
+    warnings = []
+    cols = injuries.columns.tolist()
+    required = ["gsis_id", "week", "practice_status"]
+    missing = [c for c in required if c not in cols]
+
+    if missing:
+        warnings.append(
+            f"[injury_signal] Missing expected columns {missing}. "
+            f"Actual columns found: {cols}. Skipping this signal."
+        )
+        return pd.DataFrame(), warnings
+
+    df = injuries.dropna(subset=["gsis_id", "week"]).copy()
+    df["practice_severity"] = df["practice_status"].map(PRACTICE_SEVERITY)
+
+    unmapped = df[df["practice_status"].notna() & df["practice_severity"].isna()]["practice_status"].unique()
+    if len(unmapped) > 0:
+        warnings.append(
+            f"[injury_signal] Found practice_status values outside the expected "
+            f"three categories: {list(unmapped)[:5]}. These are treated as missing "
+            f"rather than guessed at."
+        )
+
+    df = df.sort_values("week")
+    latest = df.groupby("gsis_id", as_index=False).tail(1).rename(columns={"gsis_id": "player_id"})
+    recent = df.groupby("gsis_id").tail(3)  # last up-to-3 reported weeks
+    trend = (
+        recent.groupby("gsis_id")["practice_severity"].mean()
+        .reset_index()
+        .rename(columns={"gsis_id": "player_id", "practice_severity": "recent_avg_practice_severity"})
+    )
+
+    keep = ["player_id", "practice_severity"]
+    if "report_status" in cols:
+        keep.append("report_status")
+    result = latest[keep].rename(columns={"practice_severity": "latest_practice_severity"})
+    result = result.merge(trend, on="player_id", how="left")
+
+    warnings.extend(
+        validate_signal("recent_avg_practice_severity", result["recent_avg_practice_severity"], (0.0, 2.0))
+    )
+    return result, warnings
 def zscore(series: pd.Series) -> pd.Series:
     mean, std = series.mean(), series.std()
     if std == 0 or np.isnan(std):
@@ -481,7 +557,7 @@ def validate_signal(name, series, expected_range):
     return warnings
 
 
-def build_dashboard_data(usage_df: pd.DataFrame, schedule_df: pd.DataFrame, player_team_map: pd.DataFrame, pressure_df: pd.DataFrame):
+def build_dashboard_data(usage_df: pd.DataFrame, schedule_df: pd.DataFrame, player_team_map: pd.DataFrame, pressure_df: pd.DataFrame, injury_df: pd.DataFrame):
     warnings = []
     warnings.extend(validate_signal("role_volatility", usage_df["role_volatility"], (0.0, 0.5)))
 
@@ -531,6 +607,26 @@ def build_dashboard_data(usage_df: pd.DataFrame, schedule_df: pd.DataFrame, play
             "without it. See the referee/pressure tabs for the specific reason."
         )
 
+    if not injury_df.empty and "recent_avg_practice_severity" in injury_df.columns:
+        injury_df = injury_df.copy()
+        # Higher severity (more limited/DNP practices) is worse, so flip the
+        # sign -- unlike contract-year, this direction is well-established
+        # (practice limitations directly predict reduced/absent playing time),
+        # so it's justified to include directionally in the composite.
+        injury_df["practice_severity_z"] = -zscore(injury_df["recent_avg_practice_severity"])
+        usage_df = usage_df.merge(
+            injury_df[["player_id", "latest_practice_severity", "recent_avg_practice_severity",
+                       "practice_severity_z"] + (["report_status"] if "report_status" in injury_df.columns else [])],
+            on="player_id",
+            how="left",
+        )
+        composite_components.append("practice_severity_z")
+    else:
+        warnings.append(
+            "[injury_signal] Not available this run -- composite score built "
+            "without it. See the injury/practice tab for the specific reason."
+        )
+
     # Use the roster's real full name for display/search when available --
     # the pbp-derived player_name column is abbreviated (e.g. "T.Kelce"),
     # which breaks searches for a full first name.
@@ -542,7 +638,9 @@ def build_dashboard_data(usage_df: pd.DataFrame, schedule_df: pd.DataFrame, play
     # Composite = average of whichever z-scored components are available
     # this run. Averaging (not summing) keeps the scale roughly comparable
     # even when a signal is temporarily missing, rather than silently
-    # shrinking everyone's score toward zero.
+    # shrinking everyone's score toward zero. Players with no injury report
+    # on file (i.e. not currently on any injury list) correctly get a
+    # neutral 0 contribution here, not a penalty.
     usage_df["composite_score"] = usage_df[composite_components].fillna(0).mean(axis=1)
 
     return usage_df, short_rest, warnings
@@ -559,13 +657,15 @@ schedule = load_schedule(SEASONS)
 rosters = load_rosters(SEASONS)
 participation = load_participation(SEASONS)
 contracts = load_contracts()
+injuries = load_injuries(SEASONS)
 usage_df = compute_usage_by_game_script(pbp)
 schedule_df = compute_schedule_effects(schedule, pbp)
 player_team_map = build_player_team_map(rosters)
 pressure_df, pressure_warnings = compute_pressure_signal(participation, pbp)
 scheme_df, scheme_warnings = compute_scheme_signal(participation, pbp)
 contract_df, contract_warnings = compute_contract_year_signal(contracts, max(SEASONS))
-usage_df, short_rest_df, warnings = build_dashboard_data(usage_df, schedule_df, player_team_map, pressure_df)
+injury_df, injury_warnings = compute_injury_signal(injuries)
+usage_df, short_rest_df, warnings = build_dashboard_data(usage_df, schedule_df, player_team_map, pressure_df, injury_df)
 
 # Contract-year status merges directly by player_id (a true player-level
 # signal, unlike the team-level ones) -- shown as context, not part of the
@@ -574,7 +674,7 @@ if not contract_df.empty:
     usage_df = usage_df.merge(contract_df, on="player_id", how="left")
 
 referee_df, referee_warnings = compute_referee_signal(schedule, pbp)
-warnings = warnings + referee_warnings + pressure_warnings + scheme_warnings + contract_warnings
+warnings = warnings + referee_warnings + pressure_warnings + scheme_warnings + contract_warnings + injury_warnings
 
 with st.expander(f"Validation report ({len(warnings)} issue(s))", expanded=len(warnings) > 0):
     if warnings:
@@ -601,16 +701,18 @@ if player_search:
             c for c in [
                 "display_name", "team", "usage_type", "total_opportunities",
                 "role_volatility", "short_rest_epa_delta", "pressure_rate_delta_vs_league",
-                "is_contract_year", "composite_score",
+                "is_contract_year", "recent_avg_practice_severity", "report_status",
+                "composite_score",
             ] if c in match.columns
         ]
         st.dataframe(match[show_cols], use_container_width=True)
 
 st.divider()
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Player usage signal", "Team rest/travel signal", "Referee/pace signal",
     "O-line/pressure signal", "Defensive scheme signal", "Contract-year signal",
+    "Injury/practice trend",
 ])
 
 with tab1:
@@ -695,6 +797,32 @@ with tab6:
         )
     else:
         st.info("No contract data available this run -- see the validation report above for why.")
+
+with tab7:
+    st.subheader("Injury / practice-participation trend")
+    st.caption(
+        "This IS fed into the composite score above -- a player trending "
+        "toward Full Participation is neutral-to-positive; one trending "
+        "toward Limited/DNP over recent weeks is penalized, since practice "
+        "status is a well-established predictor of near-term playing time "
+        "(unlike contract-year status, which is shown separately as context "
+        "only). Replaces the originally-planned NLP-on-beat-reports signal "
+        "with the league's own official practice/injury reports directly."
+    )
+    if "recent_avg_practice_severity" in usage_df.columns:
+        injury_view_cols = [
+            c for c in [
+                "display_name", "team", "latest_practice_severity",
+                "recent_avg_practice_severity", "report_status",
+            ] if c in usage_df.columns
+        ]
+        st.dataframe(
+            usage_df[injury_view_cols].dropna(subset=["recent_avg_practice_severity"]),
+            use_container_width=True,
+        )
+        st.caption("Severity scale: 0 = Full Participation, 1 = Limited, 2 = Did Not Participate.")
+    else:
+        st.info("No injury data available this run -- see the validation report above for why.")
 
 st.caption(
     "Player and team signals are now joined via each player's current roster "
