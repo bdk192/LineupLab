@@ -64,9 +64,17 @@ def add_recency_weight(df: pd.DataFrame, season_col="season", week_col="week") -
 
 
 def weighted_mean(series: pd.Series, weights: pd.Series) -> float:
-    if weights.sum() == 0 or weights.isna().all():
-        return series.mean()
-    return float(np.average(series, weights=weights.fillna(0)))
+    # Coerce both to plain float numpy arrays first -- pandas nullable/
+    # extension dtypes (e.g. "boolean" from a Polars-to-pandas conversion,
+    # common for was_pressure-style flag columns) aren't directly usable
+    # by np.average and raise a TypeError otherwise.
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+    w = pd.to_numeric(weights, errors="coerce").fillna(0).to_numpy(dtype=float)
+
+    mask = ~np.isnan(values)
+    if not mask.any() or w[mask].sum() == 0:
+        return float(np.nanmean(values)) if mask.any() else float("nan")
+    return float(np.average(values[mask], weights=w[mask]))
 
 
 # ---------------------------------------------------------------------------
