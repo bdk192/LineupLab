@@ -160,7 +160,16 @@ def compute_historical_team_baselines(
     target_season: int,
     target_week: int,
 ) -> pd.DataFrame:
-    """Team offensive EPA baseline using only games before target week."""
+    """Team offensive EPA PER GAME, using only games before target week.
+
+    NOTE: despite the function name, this returns one row per team per WEEK,
+    not a single season-long number -- the season-long baseline is computed
+    separately, downstream in compute_historical_short_rest_signal, by
+    averaging these per-game values. Grouping by season+team only (missing
+    week) collapsed every game into one row per team per season, which is
+    why the week-level merge right after this call was failing with
+    KeyError: 'week'.
+    """
     df = filter_before_week(pbp, target_season, target_week)
     off = df[df["posteam"].notna() & df["play_type"].isin(["run", "pass"])].copy()
     if off.empty:
