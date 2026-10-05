@@ -242,18 +242,25 @@ def compute_historical_pressure_signal(
     target_season: int,
     target_week: int,
 ) -> pd.DataFrame:
-    """Team pressure allowed before the target week."""
-    part = filter_before_week(participation, target_season, target_week)
+    """Team pressure allowed before the target week.
+
+    NOTE: participation (FTN charting) data has no season/week columns of
+    its own -- it's keyed only by game_id/play_id. The time cutoff is
+    enforced by filtering pbp BEFORE the merge below; participation rows
+    for games at/after the target week are naturally excluded by the
+    inner join, since those game_id/play_id pairs won't exist in the
+    already-filtered pbp.
+    """
     plays = filter_before_week(pbp, target_season, target_week)
 
-    game_col = next((c for c in ["game_id", "nflverse_game_id"] if c in part.columns), None)
-    if not game_col or "play_id" not in part.columns or "was_pressure" not in part.columns:
+    game_col = next((c for c in ["game_id", "nflverse_game_id"] if c in participation.columns), None)
+    if not game_col or "play_id" not in participation.columns or "was_pressure" not in participation.columns:
         return pd.DataFrame()
 
     keep = [game_col, "play_id", "was_pressure"]
-    if "time_to_throw" in part.columns:
+    if "time_to_throw" in participation.columns:
         keep.append("time_to_throw")
-    part = part[keep].rename(columns={game_col: "game_id"})
+    part = participation[keep].rename(columns={game_col: "game_id"})
 
     if not {"game_id", "play_id", "posteam"}.issubset(plays.columns):
         return pd.DataFrame()
