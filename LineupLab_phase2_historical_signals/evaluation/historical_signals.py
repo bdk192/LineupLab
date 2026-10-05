@@ -164,9 +164,9 @@ def compute_historical_team_baselines(
     df = filter_before_week(pbp, target_season, target_week)
     off = df[df["posteam"].notna() & df["play_type"].isin(["run", "pass"])].copy()
     if off.empty:
-        return pd.DataFrame(columns=["team", "season", "epa_per_play"])
+        return pd.DataFrame(columns=["team", "season", "week", "epa_per_play"])
     return (
-        off.groupby(["season", "posteam"])
+        off.groupby(["season", "week", "posteam"])
         .agg(epa_per_play=("epa", "mean"), plays=("epa", "size"))
         .reset_index()
         .rename(columns={"posteam": "team"})
